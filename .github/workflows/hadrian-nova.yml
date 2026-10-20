@@ -1,0 +1,142 @@
+name: Hadrian Nova pentest
+
+on:
+  # Runs after your deploy workflow finishes. Set the name to match your deploy workflow.
+  workflow_run:
+    workflows: ["Deploy to staging"]
+    types: [completed]
+
+  # Alternative: run when GitHub records a successful deployment.
+  # deployment_status:
+
+  # Alternative: run on a schedule, for example every Monday at 06:00 UTC.
+  # schedule:
+  #   - cron: "0 6 * * 1"
+
+  # Manual run from the Actions tab.
+  workflow_dispatch:
+    inputs:
+      from_ref:
+        description: "Compare from this tag or commit (leave empty to use the previous successful run)"
+        required: false
+
+concurrency:
+  group: hadrian-nova
+  cancel-in-progress: false
+
+jobs:
+  trigger-nova:
+    # Continue only after a successful deploy. For deployment_status, set the environment name.
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name == 'deployment_status' && github.event.deployment_status.state == 'success' && github.event.deployment.environment == 'staging') ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # to find the previous successful run
+    env:
+      HADRIAN_API_URL: https://api.hdrn.nu # dev, for the end-to-end test
+      HADRIAN_ORG_ID: ${{ vars.HADRIAN_ORG_ID }}
+      HADRIAN_PENTEST_ID: ${{ vars.HADRIAN_PENTEST_ID }}
+      HADRIAN_API_KEY: ${{ secrets.HADRIAN_API_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      # For schedule and workflow_dispatch, github.sha is the head of the branch the run uses (the default branch for schedule).
+      DEPLOYED_SHA: ${{ github.event.workflow_run.head_sha || github.event.deployment.sha || github.sha }}
+      DEPLOYED_REF: ${{ github.event.workflow_run.head_branch || github.event.deployment.ref || github.ref_name }}
+      DEPLOY_WORKFLOW: ${{ github.event.workflow_run.name }}
+      FROM_REF: ${{ github.event.inputs.from_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.DEPLOYED_SHA }}
+
+      - name: Work out what changed
+        id: range
+        shell: bash
+        run: |
+          TO_SHA=$(git rev-parse HEAD)
+          FROM_SHA=""
+          if [ -n "$FROM_REF" ]; then
+            FROM_SHA=$(git rev-parse "$FROM_REF^{commit}")
+          elif [ "$GITHUB_EVENT_NAME" = "workflow_run" ]; then
+            # Commit of the previous successful deploy
+            FROM_SHA=$(gh run list --workflow "$DEPLOY_WORKFLOW" --status success --limit 2 --json headSha -q '.[1].headSha' || true)
+          else
+            # Commit of the previous successful run of this workflow (the current run is not successful yet)
+            FROM_SHA=$(gh run list --workflow "$GITHUB_WORKFLOW" --status success --limit 1 --json headSha -q '.[0].headSha' || true)
+          fi
+          if [ -n "$FROM_SHA" ] && ! git cat-file -e "$FROM_SHA^{commit}" 2>/dev/null; then
+            FROM_SHA=""
+          fi
+          if [ -z "$FROM_SHA" ]; then
+            # Fall back to the previous tag, then to the last 50 commits
+            FROM_SHA=$(git describe --tags --abbrev=0 "$TO_SHA^" 2>/dev/null || git rev-list --max-count=50 HEAD | tail -n 1)
+          fi
+          FROM_SHA=$(git rev-parse "$FROM_SHA^{commit}")
+          echo "from=$FROM_SHA" >> "$GITHUB_OUTPUT"
+          echo "to=$TO_SHA" >> "$GITHUB_OUTPUT"
+          echo "Changes: $FROM_SHA..$TO_SHA"
+
+      - name: Collect commit messages and changed file paths
+        shell: bash
+        env:
+          FROM_SHA: ${{ steps.range.outputs.from }}
+          TO_SHA: ${{ steps.range.outputs.to }}
+        run: |
+          # Skip merge commits, translation syncs, dependency bumps and [ci skip] commits, then keep the newest 200.
+          git rev-list --no-merges --regexp-ignore-case --invert-grep \
+            --grep='\[ci skip\]' --grep='^New translations' --grep='^Bump' \
+            --max-count=200 "$FROM_SHA..$TO_SHA" | while read -r sha; do
+            jq -n \
+              --arg sha "$sha" \
+              --arg author "$(git log -1 --format=%an "$sha")" \
+              --arg subject "$(git log -1 --format=%s "$sha" | cut -c 1-500)" \
+              --arg body "$(git log -1 --format=%b "$sha" | head -c 500)" \
+              --argjson files "$(git show --name-only --format= "$sha" | sed '/^$/d' | head -n 50 | jq -R . | jq -s .)" \
+              '{sha: $sha, author: $author, subject: $subject, body: $body, files: $files}'
+          done | jq -s . > commits.json
+
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg ref "$DEPLOYED_REF" \
+            --arg fromSha "$FROM_SHA" \
+            --arg toSha "$TO_SHA" \
+            --slurpfile commits commits.json \
+            '{repository: $repository, ref: $ref, fromSha: $fromSha, toSha: $toSha, commits: $commits[0]}' \
+            > payload.json
+          echo "Sending $(jq '.commits | length' payload.json) commits"
+
+      - name: Start the Nova pentest
+        shell: bash
+        run: |
+          if ! curl --fail-with-body -sS -X POST \
+            "$HADRIAN_API_URL/v2/organizations/$HADRIAN_ORG_ID/pentests/$HADRIAN_PENTEST_ID/ci-runs" \
+            -H "X-Api-Key: $HADRIAN_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data @payload.json \
+            -o response.json; then
+            echo "Hadrian returned an error:"
+            cat response.json 2>/dev/null || true
+            exit 1
+          fi
+
+          case "$(jq -r '.status | ascii_downcase' response.json)" in
+            launched)
+              echo "Pentest started: $(jq -r '.url' response.json)"
+              echo "In-scope areas: $(jq -r '.inScopeAreas' response.json)"
+              if [ "$(jq -r '.usedFallback' response.json)" = "true" ]; then
+                echo "Used the source pentest's scope."
+              fi
+              ;;
+            skipped)
+              echo "No pentest started: $(jq -r '.skippedReason' response.json)"
+              ;;
+            *)
+              echo "Unexpected response:"
+              cat response.json
+              exit 1
+              ;;
+          esac

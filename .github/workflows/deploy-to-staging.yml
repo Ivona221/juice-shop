@@ -1,0 +1,12 @@
+# Stand-in deploy workflow for the Nova in CI end-to-end test. It deploys nothing; when it
+# succeeds, the Hadrian Nova pentest workflow runs through its workflow_run trigger.
+name: Deploy to staging
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Pretend deploy of $GITHUB_SHA"
