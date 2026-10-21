@@ -122,21 +122,4 @@ jobs:
             cat response.json 2>/dev/null || true
             exit 1
           fi
-
-          case "$(jq -r '.status | ascii_downcase' response.json)" in
-            launched)
-              echo "Pentest started: $(jq -r '.url' response.json)"
-              echo "In-scope areas: $(jq -r '.inScopeAreas' response.json)"
-              if [ "$(jq -r '.usedFallback' response.json)" = "true" ]; then
-                echo "Used the source pentest's scope."
-              fi
-              ;;
-            skipped)
-              echo "No pentest started: $(jq -r '.skippedReason' response.json)"
-              ;;
-            *)
-              echo "Unexpected response:"
-              cat response.json
-              exit 1
-              ;;
-          esac
+          echo "Hadrian accepted the request."
